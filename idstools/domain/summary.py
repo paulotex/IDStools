@@ -2,26 +2,29 @@
 
 The summary is built from whatever IDSs are present in the entry
 (equilibrium, core_profiles, core_sources, H&CD launchers, waves,
-edge_profiles, radiation, gas_injection, magnetics, dataset_description, ...)
-and written back into the same data entry. Power balance and confinement
-quantities (power_steady, power_loss, tau_energy, h_98, ...) are then derived
-from the summary itself. Every filled quantity records in its ``source`` node
-the IDS path it was taken or computed from.
+edge_profiles, radiation, gas_injection, magnetics, dataset_description, ...).
+Power balance and confinement quantities (power_steady, power_loss,
+tau_energy, h_98, ...) are then derived from the summary itself. Every filled
+quantity records in its ``source`` node the IDS path it was taken or computed
+from.
 
-Data Dictionary 3 and 4 entries are supported. The summary is written with
-the DD version the entry was produced with, so that the entry stays
-homogeneous; no conversion between DD versions is done. Quantities whose
-summary or source nodes do not exist in that DD version are skipped.
+Data Dictionary 3 and 4 entries are supported. The summary is built with the
+DD version the entry was produced with, so that the entry stays homogeneous
+when the summary is written back into it; no conversion between DD versions
+is done. Quantities whose summary or source nodes do not exist in that DD
+version are skipped.
 
-If the entry already holds a summary IDS nothing is done, unless ``force`` is
-given, in which case the existing summary is overwritten.
+build_summary() only reads the data entry and returns the summary IDS, in
+memory. write_summary() writes a summary IDS into a data entry; an existing
+summary is only overwritten with ``force``.
 
 The quantities computed from the profiles and derived from the summary itself
 are documented with the create_summary script.
 
 Example:
-    >>> from idstools.domain.summary import create_summary
-    >>> summary = create_summary("imas:hdf5?path=/path/to/entry", dry_run=True)
+    >>> from idstools.domain.summary import build_summary, write_summary
+    >>> summary = build_summary("imas:hdf5?path=/path/to/entry", verbose=True)
+    >>> write_summary(summary, "imas:hdf5?path=/path/to/entry")
 """
 
 import datetime
@@ -32,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 
 import imas
 import imas.ids_defs
+import imas.util
 import numpy as np
 from imas.db_entry import DBEntry
 from imas.ids_data_type import IDSDataType
@@ -1661,20 +1665,43 @@ def entry_contents(entry: DBEntry) -> Set[str]:
     return available
 
 
-def has_summary(entry: DBEntry, available: Set[str]) -> bool:
-    """True if the entry holds a readable, non-empty summary IDS.
+def open_entry(uri: str, mode: str = "r", dd_version: Optional[str] = None) -> DBEntry:
+    """Open a data entry, raising SummaryError if it cannot be opened."""
+    try:
+        return imas.DBEntry(uri, mode, dd_version=dd_version)
+    except Exception as exc:  # e.g. unknown backend, missing or invalid file
+        raise SummaryError(f"Could not open {uri}: {exc}") from exc
+
+
+def has_summary(uri: str) -> bool:
+    """True if the data entry holds a readable, non-empty summary IDS.
 
     The occurrence list alone is not enough: e.g. an HDF5 master file may
     still reference a summary whose data file is missing.
     """
-    if "summary" not in available:
-        return False
-    try:
-        summary = entry.get("summary", lazy=True, autoconvert=False)
-        return summary.ids_properties.homogeneous_time.value != EMPTY_INT
-    except Exception as exc:
-        logger.info("Summary listed in the entry but not readable (%s)", exc)
-        return False
+    with open_entry(uri) as entry:
+        try:
+            if 0 not in entry.list_all_occurrences("summary"):
+                return False
+            summary = entry.get("summary", lazy=True, autoconvert=False)
+            return summary.ids_properties.homogeneous_time.value != EMPTY_INT
+        except Exception as exc:
+            logger.info("No readable summary in the entry (%s)", exc)
+            return False
+
+
+def check_writable(uri: str, force: bool = False) -> None:
+    """Raise SummaryError if a summary IDS cannot be written into the entry.
+
+    An existing summary is only overwritten with ``force``, and never in a
+    netCDF file, whose backend cannot overwrite an IDS.
+    """
+    if not has_summary(uri):
+        return
+    if is_netcdf(uri):
+        raise SummaryError(f"{uri} already contains a summary IDS, which cannot be overwritten in a netCDF file")
+    if not force:
+        raise SummaryError(f"{uri} already contains a summary IDS (use --force, or force=True, to overwrite it)")
 
 
 def entry_dd_version(entry: DBEntry, available: Set[str]) -> Optional[str]:
@@ -1747,50 +1774,38 @@ def print_summary(builder: SummaryBuilder) -> None:
         print(f"  {path:55s} {shown:30s} <- {source}")
 
 
-def create_summary(
+def build_summary(
     uri: str,
-    force: bool = False,
-    dry_run: bool = False,
     time_base: Optional[str] = None,
     comment: Optional[str] = None,
-) -> Optional[IDSNode]:
-    """Build the summary IDS of a data entry and write it into the entry.
+    verbose: bool = False,
+) -> IDSNode:
+    """Build the summary IDS of a data entry, in memory.
+
+    The data entry is only read: use write_summary() to write the summary.
+    A summary IDS already present in the entry is ignored.
 
     Args:
         uri: IMAS URI of the data entry.
-        force: overwrite the summary IDS if the entry already holds one.
-        dry_run: build and print the summary, but do not write it.
         time_base: IDS defining the summary time base (default: the first of
             TIME_BASE_CANDIDATES present in the entry).
         comment: summary ids_properties/comment (default: the list of IDSs
             the summary was built from).
+        verbose: print the filled quantities, their first values and sources.
 
     Returns:
-        The summary IDS, or None when the entry already holds a summary and
-        neither ``force`` nor ``dry_run`` is given (nothing is done).
+        The summary IDS, in the DD version of the entry. Its
+        ids_properties/provenance references the IDSs of ``uri`` it was built
+        from, also when it is written into another entry.
 
     Raises:
         SummaryError: if the summary cannot be built from the entry.
 
     Example:
-        >>> create_summary("imas:hdf5?path=/path/to/entry", dry_run=True)
+        >>> summary = build_summary("imas:hdf5?path=/path/to/entry")
     """
-    try:
-        entry = imas.DBEntry(uri, "r")
-    except Exception as exc:  # e.g. unknown backend, missing or invalid file
-        raise SummaryError(f"Could not open {uri}: {exc}") from exc
-    with entry:
+    with open_entry(uri) as entry:
         available = entry_contents(entry)
-        if not available:
-            raise SummaryError(f"No IDS found in {uri}")
-        if has_summary(entry, available):
-            if not (force or dry_run):
-                print(f"{uri} already contains a summary IDS: nothing done (use --force to overwrite it).")
-                return None
-            if is_netcdf(uri) and not dry_run:
-                raise SummaryError(
-                    f"{uri} already contains a summary IDS, which cannot be overwritten in a netCDF file"
-                )
         available.discard("summary")
         if not available:
             raise SummaryError(f"No IDS other than summary found in {uri}")
@@ -1801,7 +1816,7 @@ def create_summary(
         raise SummaryError(f"DD version {dd_version} is not available in IMAS-Python")
     logger.info("Entry DD version: %s, IDSs: %s", dd_version, ", ".join(sorted(available)))
 
-    with imas.DBEntry(uri, "r", dd_version=dd_version) as entry:
+    with open_entry(uri, dd_version=dd_version) as entry:
         ctx = Context(entry, uri, available)
         time_base_ids, time = select_time_base(ctx, time_base)
         builder = SummaryBuilder(entry.factory.summary(), time)
@@ -1817,13 +1832,44 @@ def create_summary(
     used = sorted({src.split("/")[0].split(" ")[0] for src in builder.filled.values()} - {"summary"})
     summary.ids_properties.comment = comment or f"Generated by create_summary from: {', '.join(used)}"
     set_provenance(summary, [f"{uri}#{name}" for name in used])
-    print_summary(builder)
-
     summary.validate()
-    if dry_run:
-        print("Dry run: summary not written.")
-    else:
-        with imas.DBEntry(uri, "a", dd_version=dd_version) as entry:
-            entry.put(summary)
-        print(f"Summary written to {uri}")
+    if verbose:
+        print_summary(builder)
     return summary
+
+
+def write_summary(summary: IDSNode, uri: str, force: bool = False) -> None:
+    """Write a summary IDS into an existing data entry.
+
+    The summary is written in its own DD version, which must have the same
+    major version as the other IDSs of the entry.
+
+    Args:
+        summary: the summary IDS, e.g. from build_summary().
+        uri: IMAS URI of the data entry.
+        force: overwrite the summary IDS if the entry already holds one.
+
+    Raises:
+        SummaryError: if the entry cannot be opened, already holds a summary
+            (and ``force`` is not given, or the entry is a netCDF file), uses
+            another DD major version, or if the summary is not valid.
+
+    Example:
+        >>> write_summary(build_summary(uri), uri)
+    """
+    check_writable(uri, force)
+    dd_version = imas.util.get_data_dictionary_version(summary)
+    with open_entry(uri) as entry:
+        available = entry_contents(entry)
+        available.discard("summary")
+        entry_version = entry_dd_version(entry, available) if available else None
+    if entry_version is not None and entry_version != dd_version:
+        if entry_version.split(".")[0] != dd_version.split(".")[0]:
+            raise SummaryError(f"Cannot write a DD {dd_version} summary into {uri}, written with DD {entry_version}")
+        logger.warning("Writing a DD %s summary into %s, written with DD %s", dd_version, uri, entry_version)
+    try:
+        summary.validate()
+    except Exception as exc:
+        raise SummaryError(f"Invalid summary IDS: {exc}") from exc
+    with open_entry(uri, "a", dd_version=dd_version) as entry:
+        entry.put(summary)

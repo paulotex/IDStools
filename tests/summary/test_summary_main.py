@@ -1,11 +1,13 @@
-"""End-to-end tests of create_summary and of the command line on HDF5 data entries."""
+"""End-to-end tests of build_summary, write_summary and of the command line on data entries."""
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import imas
+import imas.util
 import numpy as np
 import pytest
 
@@ -75,12 +77,10 @@ def entry_with_summary(tmp_path, factory, backend):
     return write_entry(tmp_path / "entry", factory, with_summary=True, backend=backend)
 
 
-def test_write_summary(entry, factory, capsys):
-    assert cs.create_summary(entry) is not None
-    assert "Summary written" in capsys.readouterr().out
-    summary = read_summary(entry)
-    # written in the DD version of the entry, without conversion
-    assert summary.ids_properties.version_put.data_dictionary == factory.dd_version
+def test_build_summary(entry, factory, capsys):
+    summary = cs.build_summary(entry)
+    assert capsys.readouterr().out == ""  # silent unless verbose
+    assert imas.util.get_data_dictionary_version(summary) == factory.dd_version
     np.testing.assert_array_equal(summary.time, [1.0, 2.0])  # core_profiles time
     np.testing.assert_allclose(summary.global_quantities.ip.value, [-2e6, -3e6])
     assert summary.global_quantities.ip.source == ("equilibrium/time_slice/global_quantities/ip")
@@ -90,41 +90,82 @@ def test_write_summary(entry, factory, capsys):
     assert "core_profiles" in summary.ids_properties.comment
     names = {str(r.name) for r in summary.ids_properties.provenance.node[0].reference}
     assert names == {f"{entry}#core_profiles", f"{entry}#equilibrium"}
+    # the entry is only read
+    assert not cs.has_summary(entry)
 
 
-def test_existing_summary_is_kept(entry_with_summary, capsys):
-    assert cs.create_summary(entry_with_summary) is None
-    assert "nothing done" in capsys.readouterr().out
-    assert read_summary(entry_with_summary).ids_properties.comment == ("original summary")
+def test_build_summary_verbose(entry, capsys):
+    cs.build_summary(entry, verbose=True)
+    out = capsys.readouterr().out
+    assert out.startswith("Summary on 2 time(s)") and "global_quantities/ip" in out
+
+
+def test_build_summary_ignores_existing_summary(entry_with_summary):
+    summary = cs.build_summary(entry_with_summary, comment="new")
+    assert summary.ids_properties.comment == "new"
+    assert read_summary(entry_with_summary).ids_properties.comment == "original summary"
+
+
+def test_write_summary(entry, factory):
+    cs.write_summary(cs.build_summary(entry), entry)
+    assert cs.has_summary(entry)
+    summary = read_summary(entry)
+    # written in the DD version of the entry, without conversion
+    assert summary.ids_properties.version_put.data_dictionary == factory.dd_version
+    np.testing.assert_allclose(summary.global_quantities.ip.value, [-2e6, -3e6])
+    assert summary.global_quantities.ip.source == ("equilibrium/time_slice/global_quantities/ip")
+
+
+def test_write_existing_summary(entry_with_summary):
+    summary = cs.build_summary(entry_with_summary)
+    with pytest.raises(cs.SummaryError, match="already contains a summary"):
+        cs.write_summary(summary, entry_with_summary)
+    assert read_summary(entry_with_summary).ids_properties.comment == "original summary"
 
 
 def test_force_overwrites(entry_with_summary):
+    summary = cs.build_summary(entry_with_summary, comment="new")
     if cs.is_netcdf(entry_with_summary):
         with pytest.raises(cs.SummaryError, match="cannot be overwritten in a netCDF file"):
-            cs.create_summary(entry_with_summary, force=True)
+            cs.write_summary(summary, entry_with_summary, force=True)
         assert read_summary(entry_with_summary).ids_properties.comment == "original summary"
         return
-    cs.create_summary(entry_with_summary, force=True, comment="new")
+    cs.write_summary(summary, entry_with_summary, force=True)
     summary = read_summary(entry_with_summary)
     assert summary.ids_properties.comment == "new"
     np.testing.assert_array_equal(summary.time, [1.0, 2.0])
 
 
-def test_dry_run_does_not_write(entry_with_summary, capsys):
-    assert cs.create_summary(entry_with_summary, dry_run=True) is not None
-    out = capsys.readouterr().out
-    assert "global_quantities/ip" in out and "Dry run" in out
-    assert read_summary(entry_with_summary).ids_properties.comment == ("original summary")
+def test_write_into_other_entry(tmp_path, entry, factory, backend):
+    """The summary can be written into another entry of the same DD major version."""
+    other = write_entry(tmp_path / "other", factory, backend=backend)
+    cs.write_summary(cs.build_summary(entry), other)
+    names = {str(r.name) for r in read_summary(other).ids_properties.provenance.node[0].reference}
+    assert names == {f"{entry}#core_profiles", f"{entry}#equilibrium"}  # still the source entry
+    assert not cs.has_summary(entry)
+
+
+def test_write_other_dd_major_version(tmp_path, factory_dd3, factory_dd4, backend):
+    dd3 = write_entry(tmp_path / "dd3", factory_dd3, backend=backend)
+    dd4 = write_entry(tmp_path / "dd4", factory_dd4, backend=backend)
+    with pytest.raises(cs.SummaryError, match="Cannot write a DD 3"):
+        cs.write_summary(cs.build_summary(dd3), dd4)
+    assert not cs.has_summary(dd4)
+
+
+def test_write_invalid_summary(entry, factory):
+    summary = factory.summary()  # homogeneous_time not set
+    with pytest.raises(cs.SummaryError, match="Invalid summary"):
+        cs.write_summary(summary, entry)
 
 
 def test_time_base_option(entry):
-    cs.create_summary(entry, time_base="equilibrium")
-    np.testing.assert_array_equal(read_summary(entry).time, [0.0, 2.0])
+    np.testing.assert_array_equal(cs.build_summary(entry, time_base="equilibrium").time, [0.0, 2.0])
 
 
 def test_unknown_time_base(entry):
     with pytest.raises(cs.SummaryError, match="time base"):
-        cs.create_summary(entry, time_base="nbi")
+        cs.build_summary(entry, time_base="nbi")
 
 
 @pytest.mark.parametrize(
@@ -139,7 +180,7 @@ def test_unknown_time_base(entry):
 def test_unsupported_dd_version(entry, monkeypatch, version, message):
     monkeypatch.setattr(cs, "entry_dd_version", lambda entry, available: version)
     with pytest.raises(cs.SummaryError, match=message):
-        cs.create_summary(entry)
+        cs.build_summary(entry)
 
 
 def test_mixed_version_listing(tmp_path, factory_dd3, backend):
@@ -154,7 +195,7 @@ def test_entry_without_data(tmp_path, backend):
     imas.DBEntry(uri, "w").close()
     # an empty netCDF file is not a valid data entry
     with pytest.raises(cs.SummaryError, match="Could not open" if backend == "netcdf" else "No IDS"):
-        cs.create_summary(uri)
+        cs.build_summary(uri)
 
 
 @pytest.mark.parametrize("version", ["3.38.1", "3.42.0", "4.0.0"])
@@ -174,21 +215,43 @@ def test_set_provenance(version):
 # command line
 # --------------------------------------------------------------------------
 def run_script(*args):
-    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
+    # wide terminal: rich does not wrap the log messages
+    env = {**os.environ, "COLUMNS": "300"}
+    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=env)
 
 
 def test_command_line(tmp_path, factory_dd4):
     uri = write_entry(tmp_path / "entry", factory_dd4)
     result = run_script("-u", uri, "--time-base", "equilibrium", "--comment", "from the CLI")
     assert result.returncode == 0, result.stderr
-    assert "Summary written" in result.stdout
+    assert result.stdout.strip() == f"Summary written to {uri}"  # no table without -v
     summary = read_summary(uri)
     assert summary.ids_properties.comment == "from the CLI"
     np.testing.assert_array_equal(summary.time, [0.0, 2.0])
 
-    result = run_script("--uri", uri)
+
+def test_command_line_existing_summary(tmp_path, factory_dd4):
+    uri = write_entry(tmp_path / "entry", factory_dd4, with_summary=True)
+    result = run_script("--uri", uri, "-v")
+    assert result.returncode == 1
+    assert "already contains a summary" in result.stdout + result.stderr
+    assert "Summary on" not in result.stdout  # checked before building the summary
+    assert read_summary(uri).ids_properties.comment == "original summary"
+
+
+def test_command_line_dry_run(tmp_path, factory_dd4):
+    uri = write_entry(tmp_path / "entry", factory_dd4, with_summary=True)
+    result = run_script("--uri", uri, "--dry-run")
     assert result.returncode == 0, result.stderr
-    assert "nothing done" in result.stdout
+    assert "global_quantities/ip" in result.stdout and "Dry run: summary not written." in result.stdout
+    assert read_summary(uri).ids_properties.comment == "original summary"
+
+
+def test_command_line_verbose(tmp_path, factory_dd4):
+    uri = write_entry(tmp_path / "entry", factory_dd4)
+    result = run_script("--uri", uri, "-v")
+    assert result.returncode == 0, result.stderr
+    assert "global_quantities/ip" in result.stdout and "Summary written" in result.stdout
 
 
 def test_command_line_uri_required(tmp_path, factory_dd4):
@@ -205,6 +268,7 @@ def test_command_line_error(tmp_path, factory_dd4):
     assert "Could not determine a time base" in result.stdout + result.stderr
 
 
-def test_missing_entry(tmp_path):
+@pytest.mark.parametrize("function", ["build_summary", "has_summary"])
+def test_missing_entry(tmp_path, function):
     with pytest.raises(cs.SummaryError, match="Could not open"):
-        cs.create_summary(str(tmp_path / "missing.nc"))
+        getattr(cs, function)(str(tmp_path / "missing.nc"))

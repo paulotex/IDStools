@@ -11,22 +11,40 @@ Each filled summary quantity records in its ``source`` node the IDS path it
 was taken or computed from. Quantities that cannot be obtained from the IDSs
 of the entry are left empty.
 
-- If the entry already contains a summary IDS nothing is done, unless
-  ``--force`` is given (the existing summary is then overwritten). A summary
-  cannot be overwritten in a netCDF file.
+- If the entry already contains a summary IDS, the command stops with an
+  error before building the summary, unless ``--force`` is given (the
+  existing summary is then overwritten). A summary cannot be overwritten in a
+  netCDF file.
 - ``--time-base IDS`` selects the IDS defining the summary time base
   (default: the first of core_profiles, plasma_profiles, edge_profiles,
   equilibrium, core_sources, magnetics). Signals not covering the whole time
   base are left out.
 - ``--dry-run`` builds and prints the summary without writing it.
+- ``-v`` also prints the summary on a normal run, with informative messages;
+  ``-vv`` adds debug messages.
 
-The same function is available from Python:
+From Python, the summary is built in memory and only written on request:
 
 .. code-block:: python
 
-   from idstools.domain.summary import create_summary
+   from idstools.domain.summary import build_summary, write_summary
 
-   summary = create_summary("imas:hdf5?path=/path/to/entry", dry_run=True)
+   summary = build_summary("imas:hdf5?path=/path/to/entry", verbose=True)  # reads the entry only
+   write_summary(summary, "imas:hdf5?path=/path/to/entry")
+
+- ``build_summary(uri, time_base=None, comment=None, verbose=False)`` returns
+  the summary IDS, in the DD version of the entry. With ``verbose``, it
+  prints the filled quantities. An existing summary in the entry is ignored.
+- ``write_summary(summary, uri, force=False)`` writes a summary IDS into an
+  existing data entry. It refuses to overwrite an existing summary without
+  ``force`` (and always in a netCDF file), and to write into an entry of
+  another DD major version.
+- ``has_summary(uri)`` and ``check_writable(uri, force)`` check the entry
+  beforehand.
+- The summary ``ids_properties/provenance`` references the entry it was
+  built from, also when it is written into another entry.
+
+All of them raise ``SummaryError`` on failure.
 
 ***********************
  Syntax create_summary
