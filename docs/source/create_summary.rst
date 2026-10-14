@@ -41,8 +41,9 @@ From Python, the summary is built in memory and only written on request:
   another DD major version.
 - ``has_summary(uri)`` and ``check_writable(uri, force)`` check the entry
   beforehand.
-- The summary ``ids_properties/provenance`` references the entry it was
-  built from, also when it is written into another entry.
+- The summary ``ids_properties/provenance`` references the IDSs of the
+  entry it was built from (those appearing as paths in the ``source``
+  nodes), also when it is written into another entry.
 
 All of them raise ``SummaryError`` on failure.
 
@@ -137,10 +138,13 @@ Quantities computed from the IDSs
      - core_profiles ``global_quantities/ip`` − ``current_non_inductive``
    * - ``global_quantities/energy_thermal``, ``energy_electrons_thermal``,
        ``energy_ion_total_thermal``
-     - 3/2 × volume integral of the thermal pressures of core_profiles
-       (``pressure_thermal``, ``electrons/pressure_thermal``,
-       ``pressure_ion_total``). Without them, the pressures are computed as
-       e·n·T per species.
+     - 3/2 × volume integral of the electron and ion thermal pressures of
+       core_profiles (``electrons/pressure_thermal``,
+       ``pressure_ion_total``; without them, e·n·T per species).
+       ``energy_thermal`` is the sum of the electron and ion energies, so
+       that the summary is consistent. ``pressure_thermal`` is only used when
+       one of them is missing; otherwise a warning is logged when its energy
+       differs from the sum by more than 1%.
    * - ``global_quantities/energy_total``
      - Volume integral of (``pressure_parallel``/2 +
        ``pressure_perpendicular``), which includes the fast particles. Only

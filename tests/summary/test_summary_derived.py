@@ -51,9 +51,42 @@ def test_core_profiles_pressures_preferred(make_ctx, factory):
     np.testing.assert_allclose(b.get("global_quantities/energy_thermal"), [1.2e8] * 2)
     np.testing.assert_allclose(b.get("global_quantities/energy_electrons_thermal"), [4.8e7] * 2)
     np.testing.assert_allclose(b.get("global_quantities/energy_ion_total_thermal"), [7.2e7] * 2)
-    assert b.filled["global_quantities/energy_thermal"].startswith("core_profiles/profiles_1d/pressure_thermal ")
+    # the total is the sum of the components, pressure_thermal only checks it
+    assert b.filled["global_quantities/energy_thermal"] == (
+        "core_profiles/profiles_1d/(electrons/pressure_thermal+pressure_ion_total) (3/2 volume integral)"
+    )
     # no fast particle pressures: no total energy
     assert not b.has("global_quantities/energy_total")
+
+
+@pytest.mark.parametrize("p_total, warned", [(1.005e5, False), (13.3, True)])
+def test_core_profiles_inconsistent_pressure_thermal(make_ctx, factory, caplog, p_total, warned):
+    """A pressure_thermal inconsistent with the electron + ion pressures is
+    reported, and the thermal energy stays the sum of its components."""
+    cp = make_core_profiles(factory)
+    for profile in cp.profiles_1d:
+        profile.pressure_thermal = np.full(3, p_total)
+        profile.electrons.pressure_thermal = np.full(3, 4e4)
+        profile.pressure_ion_total = np.full(3, 6e4)
+    ctx = make_ctx({"core_profiles": cp})
+    cs.fill_core_profiles(ctx)
+    np.testing.assert_allclose(ctx.builder.get("global_quantities/energy_thermal"), [1.2e8] * 2)
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("pressure_thermal disagrees" in m and "at 2 of 2 time(s)" in m for m in messages) == warned
+
+
+def test_core_profiles_pressure_thermal_only(make_ctx, factory, caplog):
+    """pressure_thermal is used when the ion pressure is missing."""
+    cp = make_core_profiles(factory)  # no ion temperature
+    for profile in cp.profiles_1d:
+        profile.pressure_thermal = np.full(3, 1e5)
+    ctx = make_ctx({"core_profiles": cp})
+    cs.fill_core_profiles(ctx)
+    b = ctx.builder
+    np.testing.assert_allclose(b.get("global_quantities/energy_thermal"), [1.2e8] * 2)
+    assert b.filled["global_quantities/energy_thermal"].startswith("core_profiles/profiles_1d/pressure_thermal ")
+    assert not b.has("global_quantities/energy_ion_total_thermal")
+    assert "disagrees" not in caplog.text
 
 
 def test_core_profiles_no_ion_temperature(make_ctx, factory):

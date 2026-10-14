@@ -31,7 +31,7 @@ import datetime
 import getpass
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import imas
 import imas.ids_defs
@@ -636,6 +636,10 @@ SUMMARY_LOCATION = {
     "volume_average": "volume_average",
     "line_average": "line_average",
 }
+# relative difference tolerated between the thermal energies from
+# pressure_thermal and from the electron + ion pressures
+THERMAL_ENERGY_TOLERANCE = 0.01
+
 SOURCE_NOTE = {
     "magnetic_axis": "value on axis",
     "separatrix": "value at rho_tor_norm=1",
@@ -690,7 +694,9 @@ def thermal_pressures(profile: IDSNode) -> Dict[str, Tuple[str, np.ndarray]]:
     """Thermal pressures [Pa] of a core profile, with the path they come from.
 
     Returns a dict name -> (path, pressure) for "electrons", "ions" and
-    "total", each present only when it can be obtained.
+    "total", each present only when it can be obtained. The total is
+    electrons + ions when both are available, else pressure_thermal; in the
+    first case pressure_thermal, if present, is returned as "reported_total".
     """
     n_rho = profile.grid.rho_tor_norm.size
 
@@ -735,14 +741,19 @@ def thermal_pressures(profile: IDSNode) -> Dict[str, Tuple[str, np.ndarray]]:
         if p_i is not None:
             pressures["ions"] = (f"ion[:]/({'|'.join(sorted(paths))})", p_i)
 
+    # the total is the sum of the electron and ion pressures, so that the
+    # summary energies are consistent; pressure_thermal is only used when a
+    # component is missing, and otherwise returned to be checked
     p_total = get_value(profile, "pressure_thermal")
-    if valid(p_total):
-        pressures["total"] = ("pressure_thermal", p_total)
-    elif "electrons" in pressures and "ions" in pressures:
+    if "electrons" in pressures and "ions" in pressures:
         pressures["total"] = (
             f"({pressures['electrons'][0]}+{pressures['ions'][0]})",
             pressures["electrons"][1] + pressures["ions"][1],
         )
+        if valid(p_total):
+            pressures["reported_total"] = ("pressure_thermal", p_total)
+    elif valid(p_total):
+        pressures["total"] = ("pressure_thermal", p_total)
     return pressures
 
 
@@ -789,6 +800,7 @@ def fill_core_profiles(ctx: Context) -> None:
     if times is None or not len(cp.profiles_1d):
         return
     series: Dict[Tuple[str, str], List[float]] = {}  # (summary path, source) -> values per time slice
+    energy_checks: List[Tuple[float, float]] = []  # thermal energy from electrons + ions, from pressure_thermal
 
     def add(it: int, dst: str, src: str, value: float) -> None:
         series.setdefault((dst, src), [np.nan] * len(cp.profiles_1d))
@@ -840,19 +852,46 @@ def fill_core_profiles(ctx: Context) -> None:
                     float(reduce(y)),
                 )
         if "volume_integral" in reductions:
-            for dst, src, value in profile_integrals(profile, reductions):
+            for dst, src, value in profile_integrals(profile, reductions, energy_checks):
                 add(it, dst, f"core_profiles/profiles_1d/{src}", value)
 
     for (dst, src), values in series.items():
         ctx.builder.set_signal(dst, times, np.array(values), src)
+    check_thermal_energy(energy_checks)
+
+
+def check_thermal_energy(energy_checks: Sequence[Tuple[float, float]]) -> None:
+    """Warn when pressure_thermal disagrees with the electron + ion pressures.
+
+    The DD defines pressure_thermal as the electron + ion thermal pressure;
+    a mismatch points to an inconsistent core_profiles IDS.
+    """
+    w_sum, w_reported = np.array(energy_checks, dtype=float).reshape(-1, 2).T
+    bad = ~np.isclose(w_reported, w_sum, rtol=THERMAL_ENERGY_TOLERANCE, atol=0)
+    if not bad.any():
+        return
+    first = int(np.argmax(bad))
+    logger.warning(
+        "core_profiles pressure_thermal disagrees with the electron + ion thermal pressures at %d of %d time(s)"
+        " (first: thermal energies %.4g J and %.4g J): energy_thermal is the electron + ion energy",
+        bad.sum(),
+        len(bad),
+        w_reported[first],
+        w_sum[first],
+    )
 
 
 def profile_integrals(
-    profile: IDSNode, reductions: Dict[str, Callable[[np.ndarray], float]]
+    profile: IDSNode,
+    reductions: Dict[str, Callable[[np.ndarray], float]],
+    energy_checks: Optional[List[Tuple[float, float]]] = None,
 ) -> List[Tuple[str, str, float]]:
     """Energy contents and hydrogenic composition of a core profile.
 
-    Returns a list of (summary path, source path, value).
+    Returns a list of (summary path, source path, value). When the thermal
+    energy is computed from the electron and ion pressures and the profile
+    also has pressure_thermal, (energy from the components, energy from
+    pressure_thermal) is appended to ``energy_checks``.
     """
     integrate = reductions["volume_integral"]
     average = reductions["volume_average"]
@@ -870,6 +909,8 @@ def profile_integrals(
             path, pressure = pressures[key]
             src = f"{path} (3/2 volume integral)"
             results.append((dst, src, 1.5 * integrate(pressure)))
+    if "reported_total" in pressures and energy_checks is not None:
+        energy_checks.append((1.5 * integrate(pressures["total"][1]), 1.5 * integrate(pressures["reported_total"][1])))
     # total kinetic pressure (p_par + 2 p_perp) / 3, including fast particles
     p_par = get_value(profile, "pressure_parallel")
     p_perp = get_value(profile, "pressure_perpendicular")
@@ -1733,6 +1774,22 @@ def select_time_base(ctx: Context, requested: Optional[str]) -> Tuple[str, np.nd
     )
 
 
+def source_ids(sources: Iterable[str], available: Set[str]) -> List[str]:
+    """Names of the IDSs of the entry referenced as paths in the source texts.
+
+    Only IDSs present in the entry count, so that descriptive text in the
+    sources (e.g. "d/dt of summary/...", "IPB98(y,2) scaling") is ignored.
+    The summary quantities derived from other summary quantities add no IDS:
+    their inputs record their own.
+    """
+    used = set()
+    for source in sources:
+        for name in re.findall(r"(?<![\w/])([a-z][a-z0-9_]*)/", source):
+            if name in available:
+                used.add(name)
+    return sorted(used)
+
+
 def set_provenance(summary: IDSNode, references: Sequence[str]) -> None:
     """Record the source IDSs in ids_properties/provenance (whole IDS)."""
     provenance = get_node(summary, "ids_properties/provenance/node")
@@ -1829,7 +1886,7 @@ def build_summary(
                 logger.exception("Filler failed, continuing with the next one")
 
     summary = builder.ids
-    used = sorted({src.split("/")[0].split(" ")[0] for src in builder.filled.values()} - {"summary"})
+    used = source_ids(builder.filled.values(), available)
     summary.ids_properties.comment = comment or f"Generated by create_summary from: {', '.join(used)}"
     set_provenance(summary, [f"{uri}#{name}" for name in used])
     summary.validate()
